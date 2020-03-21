@@ -1,0 +1,139 @@
+---
+title: "Datathon"
+author: "Fishers little elves"
+date: "11/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(reticulate)
+require(tidyverse)
+require(sf)
+require(rgdal)
+require(lubridate)
+require(data.table)
+require(httr)
+require(tmap)
+leuven_air_quality <- read_csv('/Users/jara_/Documents/Master Statistics KU Leuven/Datathon/LeuvenData/LEUVENAIRfulldump2018.csv.gz')
+url <- list(hostname = "telraam-api.net/v0/segments/active",
+              scheme= "https",
+             query = list(request = "GetFeature", 
+                          outputFormat = "application/json ")) %>% 
+  setattr("class", "url")
+request <- build_url(url)
+active <- st_read(request)
+leuven_air_mutated <- leuven_air_quality %>% mutate(date_mutated = as.Date(DATEUTC), lat_mutated = as.character(LAT), lon_mutated = as.character(LON))
+leuven_air_summarised <- leuven_air_mutated %>% group_by(date_mutated, lat_mutated, lon_mutated) %>% summarise(humidity_mean = mean(HUMIDITY))
+```
+
+First of all, gathering the data from cameras
+
+```{python}
+import json
+import requests as rq 
+import pandas as pd
+from pandas.io.json import json_normalize
+import string as string
+import numpy as np
+url_cameras = "https://telraam-api.net/v0/cameras"
+request_cameras = rq.get(url_cameras)
+df1 = json_normalize(request_cameras.json()['cameras'])
+df1['mac'].count()
+df1['mac'].nunique()
+url_segments = "https://telraam-api.net/v0/segments/all"
+request_segments = rq.get(url_segments)
+df2 = json_normalize(request_segments.json()['features'])
+df_geometric = list(range(len(df2['properties.oidn'])))
+master_url_geometric =  "https://telraam-api.net/v0/segments/id/"
+for i in df_geometric:
+        geometric_request = master_url_geometric + str(int(df2['properties.oidn'][[i]]))
+        geometric_final_request = rq.get(geometric_request).json()
+        df_geometric[i] = np.array(geometric_final_request['features'][0]['geometry']['coordinates'][0])
+
+```
+
+Secondly, gatherin the data from segments
+
+```{python}
+url_segments = "https://telraam-api.net/v0/segments/all"
+request_segments = rq.get(url_segments)
+df2 = json_normalize(request_segments.json()['features'])
+```
+
+
+Not a sample, gathering the frame to be better. 
+
+```{r storing data frames}
+df_cameras <- py$df1
+df_segments <- py$df2
+geometric_dfs <- py$df_geometric
+for(i in 1:nrow(df_segments))
+  geometric_dfs[[i]] <- cbind(geometric_dfs[[i]], df_segments$properties.oidn[i])
+geometric_dfs_final <- do.call(rbind, geometric_dfs) %>% as.data.frame()
+names(geometric_dfs_final) <- c('Longitude', 'Latitude', 'segment_id')
+geometric_dfs_final$segment_id <- geometric_dfs_final$segment_id %>% as.character()
+```
+
+Gathering from Python
+
+```{python}
+param = "{\n    \"time_start\": \"2019-01-01 00:00\",\n    \"time_end\": \"2020-06-06 23:59\",\n    \"level\": \"segments\",\n    \"format\": \"per-hour\"\n}"
+headers = {'Content-Type': 'application/json'}
+master_url_request = "https://telraam-api.net/v0/reports/"
+dfs_reports = list(range(len(df2['properties.oidn'])))
+for i in dfs_reports:
+    dfs_reports[i] = master_url_request + str(int(df2['properties.oidn'][[i]]))
+    dfs_reports[i] = rq.request("POST", dfs_reports[i], headers=headers, data = param)
+    dfs_reports[i] = json_normalize(dfs_reports[i].json()['report'])
+```
+
+```{r}
+reports <- py$dfs_reports
+reports_binded <- do.call(rbind, reports) %>% mutate(date = ymd_hm(date), segment_id = as.factor(segment_id)) %>% 
+  as.data.frame()
+joined_bined <- inner_join(reports_binded, geometric_dfs_final, by = 'segment_id')
+joined_bined %>% group_by(segment_id) %>% summarise(amount = n())
+individual_test <- dplyr::filter(reports_binded, segment_id == '506176')
+p <- ggplot(individual_test, aes(x = date, y = car)) + geom_line()
+
+```
+
+```{r}
+shape_route <- "/Users/jara_/Documents/Master Statistics KU Leuven/Datathon/Shape Files/Leuven__Deelgemeenten/"
+shape_file <- "Leuven__Deelgemeenten.shp"
+shape_file_leuven <- paste(shape_route, shape_file, sep = '')
+shape_lines_leuven <- readOGR(shape_file_leuven)
+dis_file<-st_join(active, shape_lines_leuven %>% st_as_sf())
+filtered_leuven <- filter(dis_file, !is.na(OBJECTID))
+names(filtered_leuven)[1] <- 'segment_id'
+filtered_leuven$segment_id <- as.factor(filtered_leuven$segment_id)
+leuven_segments <- inner_join(reports_binded, filtered_leuven, by = 'segment_id') %>% 
+  select(-c(pedestrian.y, bike.y, lorry.y, pedestrian_avg, bike_avg, car_avg, lorry_avg, typical_data))
+sample <- filter(leuven_segments_sf, date(date) == '2020-02-18') %>% head(10000) %>% mutate(hours = hour(date))
+sample_sf <- st_as_sf(sample)
+leuven_segments_sf <- st_as_sf(leuven_segments)
+other_leuven_segments <- leuven_segments %>% filter(date(date) == '2020-01-01') %>% st_as_sf()
+dat_animation <- tm_shape(shape_lines_leuven) + tm_polygons() + tm_shape(sample_sf) + tm_dots(size = 'car.x') + tm_facets(along = 'hours', free.coords = FALSE)
+tmap_animation(dat_animation, width = 1200, height = 1200, delay = 40)
+ggplot() + geom_polygon(data = shape_lines_leuven, aes(x = long, y = lat, group = group)) + geom_sf(data = sample)
+```
+
+```{r}
+leuven_segments_date <- leuven_segments %>% mutate(date_with_no_hour = date(date))
+ts_cars <- leuven_segments_date %>% group_by(segment_id, date_with_no_hour) %>% summarise(total_y = sum(car.x)) %>% as.data.frame()
+test_ts_cars <- filter(ts_cars, segment_id == '506176') %>% select(-c(segment_id))
+ts_cars_as_ts <- test_ts_cars %>% zoo::read.zoo()
+outliers <- forecast::tsoutliers(ts_cars_as_ts)
+outliers_frame <- ts_cars_as_ts[outliers$index] %>% as.data.frame() %>% rownames_to_column()
+names(outliers_frame) <- c('date', 'total')
+outliers_frame
+cocky_plot <- ggplot(test_ts_cars, aes(x = date_with_no_hour, y = total_y)) + 
+  geom_line() + geom_point(data = outliers_frame, mapping = aes(x = as.Date(date), y = total), color = 'red')
+ggplotly(cocky_plot)
+```
+
+
+```{r}
+tm_shape(shape_lines_leuven) + tm_polygons()
+```
